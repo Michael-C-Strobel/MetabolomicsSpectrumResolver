@@ -15,6 +15,9 @@ timeout = 45  # seconds
 MS2LDA_SERVER = "http://ms2lda.org/basicviz/"
 MOTIFDB_SERVER = "http://ms2lda.org/motifdb/"
 MASSBANK_SERVER = "https://massbank.us/rest/spectra/"
+# GNPS2 library knowledgebase (our service) — serves the gnpsspectrum provider
+# contract for our accessions (CCMSLIB and minted GNPS2LIB ids).
+GNPS2_LIBRARY_SERVER = "https://library.gnps2.org"
 
 # USI specification: http://www.psidev.info/usi
 usi_pattern = re.compile(
@@ -42,8 +45,9 @@ usi_metabolomics_pattern = re.compile(
     r"^mzspec"
     # collection identifier
     # Unofficial proteomics spectral library identifier: MASSIVEKB
-    # Metabolomics collection identifiers: GNPS, MASSBANK, MS2LDA, MOTIFDB
-    r":(MASSIVEKB|GNPS|MASSBANK|MS2LDA|MOTIFDB)"
+    # Metabolomics collection identifiers: GNPS, GNPS2, MASSBANK, MS2LDA, MOTIFDB
+    # (GNPS2 before GNPS so it wins the alternation for "GNPS2".)
+    r":(MASSIVEKB|GNPS2|GNPS|MASSBANK|MS2LDA|MOTIFDB)"
     # msRun identifier
     r":(.*)"
     # index flag
@@ -110,6 +114,8 @@ def parse_usi(usi: str) -> Tuple[sus.MsmsSpectrum, str, str]:
             spectrum, source_link = _parse_msv_pxd(usi)
         elif collection == "gnps":
             spectrum, source_link = _parse_gnps(usi)
+        elif collection == "gnps2":
+            spectrum, source_link = _parse_gnps2_library(usi)
         elif collection == "massbank":
             spectrum, source_link = _parse_massbank(usi)
         elif collection == "ms2lda":
@@ -358,7 +364,39 @@ def _parse_gnps_task(usi: str) -> Tuple[sus.MsmsSpectrum, str]:
         raise UsiError("Unknown GNPS task USI", 404)
 
 
-# Parse GNPS library.
+# Fetch a gnpsspectrum-shaped record from `request_url` and build the spectrum.
+# Both the GNPS2 library server and the legacy GNPS ProteoSAFe endpoint return
+# this same shape. Raises on any failure (HTTP error, bad JSON, "null" peaks).
+def _fetch_gnps_library_spectrum(
+    usi: str, request_url: str
+) -> sus.MsmsSpectrum:
+    lookup_request = requests.get(request_url, timeout=timeout)
+    lookup_request.raise_for_status()
+    spectrum_dict = lookup_request.json()
+    if spectrum_dict["spectruminfo"]["peaks_json"] == "null":
+        raise UsiError("Unknown GNPS library USI", 404)
+    mz, intensity = zip(
+        *json.loads(spectrum_dict["spectruminfo"]["peaks_json"])
+    )
+    # Use the most up-to-date spectrum annotation.
+    annotations = sorted(
+        spectrum_dict["annotations"],
+        key=lambda annotation: datetime.datetime.strptime(
+            annotation["create_time"], "%Y-%m-%d %H:%M:%S.%f"
+        ),
+        reverse=True,
+    )[0]
+    return sus.MsmsSpectrum(
+        usi,
+        float(annotations["Precursor_MZ"]),
+        int(annotations["Charge"]),
+        mz,
+        intensity,
+    )
+
+
+# Parse GNPS library (legacy CCMSLIB accessions). Resolve against our GNPS2
+# library server first; fall back to the legacy GNPS ProteoSAFe endpoint.
 def _parse_gnps_library(usi: str) -> Tuple[sus.MsmsSpectrum, str]:
     match = _match_usi(usi)
     index_flag = match.group(3)
@@ -367,42 +405,45 @@ def _parse_gnps_library(usi: str) -> Tuple[sus.MsmsSpectrum, str]:
             "Currently supported GNPS library index flags: accession", 400
         )
     index = match.group(4)
+    source_link = (
+        f"https://gnps.ucsd.edu/ProteoSAFe/"
+        f"gnpslibraryspectrum.jsp?SpectrumID={index}"
+    )
     try:
-        request_url = (
-            f"https://gnps.ucsd.edu/ProteoSAFe/"
-            f"SpectrumCommentServlet?SpectrumID={index}"
-        )
-        lookup_request = requests.get(request_url, timeout=timeout)
-        lookup_request.raise_for_status()
-        spectrum_dict = lookup_request.json()
-        if spectrum_dict["spectruminfo"]["peaks_json"] == "null":
-            raise UsiError("Unknown GNPS library USI", 404)
-        mz, intensity = zip(
-            *json.loads(spectrum_dict["spectruminfo"]["peaks_json"])
-        )
-        source_link = (
-            f"https://gnps.ucsd.edu/ProteoSAFe/"
-            f"gnpslibraryspectrum.jsp?SpectrumID={index}"
-        )
-
-        # Use the most up-to-date spectrum annotation.
-        annotations = sorted(
-            spectrum_dict["annotations"],
-            key=lambda annotation: datetime.datetime.strptime(
-                annotation["create_time"], "%Y-%m-%d %H:%M:%S.%f"
-            ),
-            reverse=True,
-        )[0]
-        spectrum = sus.MsmsSpectrum(
-            usi,
-            float(annotations["Precursor_MZ"]),
-            int(annotations["Charge"]),
-            mz,
-            intensity,
+        spectrum = _fetch_gnps_library_spectrum(
+            usi, f"{GNPS2_LIBRARY_SERVER}/gnpsspectrum?SpectrumID={index}"
         )
         return spectrum, source_link
-    except requests.exceptions.HTTPError:
-        raise UsiError("Unknown GNPS library USI", 404)
+    except (requests.exceptions.RequestException, ValueError, KeyError, UsiError):
+        # Fall back to the legacy GNPS ProteoSAFe endpoint.
+        try:
+            spectrum = _fetch_gnps_library_spectrum(
+                usi,
+                f"https://gnps.ucsd.edu/ProteoSAFe/"
+                f"SpectrumCommentServlet?SpectrumID={index}",
+            )
+            return spectrum, source_link
+        except requests.exceptions.HTTPError:
+            raise UsiError("Unknown GNPS library USI", 404)
+
+
+# Parse GNPS2 library (our minted GNPS2LIB accessions). Resolved only against
+# our GNPS2 library server — there is no legacy fallback for these ids.
+def _parse_gnps2_library(usi: str) -> Tuple[sus.MsmsSpectrum, str]:
+    match = _match_usi(usi)
+    index_flag = match.group(3)
+    if index_flag.lower() != "accession":
+        raise UsiError(
+            "Currently supported GNPS2 library index flags: accession", 400
+        )
+    index = match.group(4)
+    try:
+        spectrum = _fetch_gnps_library_spectrum(
+            usi, f"{GNPS2_LIBRARY_SERVER}/gnpsspectrum?SpectrumID={index}"
+        )
+        return spectrum, GNPS2_LIBRARY_SERVER
+    except (requests.exceptions.RequestException, ValueError, KeyError):
+        raise UsiError("Unknown GNPS2 library USI", 404)
 
 
 # Parse MassBank entry.
